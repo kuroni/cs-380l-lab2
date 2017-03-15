@@ -9,9 +9,9 @@
 
 #include "log.h"
 
-FILE *log_open() {
+FILE *log_open(char *logFile) {
   FILE *logfile;
-  logfile = fopen("bbfs.log", "w");
+  logfile = fopen(logFile, "w");
   if (logfile == NULL) {
     perror("logfile");
     exit(EXIT_FAILURE);

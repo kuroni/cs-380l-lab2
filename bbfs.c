@@ -586,7 +586,7 @@ struct fuse_operations bb_oper = {
 };
 
 void bb_usage() {
-  fprintf(stderr, "usage:  bbfs [FUSE and mount options] rootDir mountPoint\n");
+  fprintf(stderr, "usage:  bbfs [FUSE and mount options] rootDir mountPoint logFile\n");
   abort();
 }
 
@@ -594,13 +594,13 @@ int main(int argc, char *argv[]) {
   int fuse_stat;
   struct bb_state *bb_data;
   if ((getuid() == 0) || (geteuid() == 0)) {
-    fprintf(stderr, "Running BBFS as root opens unnacceptable security holes\n");
+    fprintf(stderr, "Please do not run bb as root\n");
     return 1;
   }
 
   fprintf(stderr, "Fuse library version %d.%d\n", FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION);
 
-  if ((argc < 3) || (argv[argc-2][0] == '-') || (argv[argc-1][0] == '-')) {
+  if ((argc < 4) || (argv[argc - 3][0] == '-') || (argv[argc - 2][0] == '-') || (argv[argc - 1][0] == '-')) {
     bb_usage();
   }
 
@@ -610,16 +610,19 @@ int main(int argc, char *argv[]) {
     abort();
   }
 
-  bb_data->rootdir = realpath(argv[argc-2], NULL);
-  argv[argc-2] = argv[argc-1];
-  argv[argc-1] = NULL;
-  argc--;
+  char *logFile = argv[argc - 1];
+  argv[argc - 1] = NULL;
+  bb_data->rootdir = realpath(argv[argc - 3], NULL);
+  argv[argc - 3] = argv[argc - 2];
+  argv[argc - 2] = NULL;
+  argc -= 2;
 
-  bb_data->logfile = log_open();
+  bb_data->logfile = log_open(logFile);
 
   fprintf(stderr, "about to call fuse_main\n");
   fuse_stat = fuse_main(argc, argv, &bb_oper, bb_data);
   fprintf(stderr, "fuse_main returned %d\n", fuse_stat);
 
+  free(bb_data);
   return fuse_stat;
 }

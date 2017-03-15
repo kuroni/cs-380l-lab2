@@ -106,7 +106,7 @@ int bb_mkdir(const char *path, mode_t mode) {
 int bb_unlink(const char *path) {
   char fpath[PATH_MAX];
 
-  log_command("bb_unlink(path=\"%s\")\n", path);
+  log_command("bb_unlink(path=\"%s\")", path);
   bb_fullpath(fpath, path);
 
   return log_syscall("unlink", unlink(fpath), 0);

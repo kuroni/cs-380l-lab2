@@ -25,8 +25,7 @@
 static void bb_fullpath(char fpath[PATH_MAX], const char *path) {
   strcpy(fpath, BB_DATA->rootdir);
   strncat(fpath, path, PATH_MAX); // ridiculously long paths will
-  log_msg("    bb_fullpath:  rootdir = \"%s\", path = \"%s\", fpath = \"%s\"\n",
-          BB_DATA->rootdir, path, fpath);
+  log_msg("    bb_fullpath:  rootdir = \"%s\", path = \"%s\", fpath = \"%s\"\n", BB_DATA->rootdir, path, fpath);
 }
 
 /**

@@ -329,7 +329,7 @@ int bb_getxattr(const char *path, const char *name, char *value, size_t size) {
   int retstat = 0;
   char fpath[PATH_MAX];
 
-  log_command("bb_getxattr(path = \"%s\", name = \"%s\", value = 0x%08x, size = %d)", path, name, value, size);
+  log_command("bb_getxattr(path=\"%s\", name=\"%s\", value=0x%08x, size=%d)", path, name, value, size);
   bb_fullpath(fpath, path);
 
   retstat = log_syscall("lgetxattr", lgetxattr(fpath, name, value, size), 0);

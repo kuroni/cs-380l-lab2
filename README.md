@@ -1,3 +1,3 @@
-# Big Brother File System
+Build with `cmake ./`, then `make`, then run with `./bbfs [FUSE and mount options] remoteAddress mountPoint logFile`. Requires libssh and fuse to be installed.
 
-An experimental POSIX interceptor designed to log POSIX calls to a directory, by proxying them using FUSE.
+For the experiments, run with `<experiment_file> <dest_file>`.

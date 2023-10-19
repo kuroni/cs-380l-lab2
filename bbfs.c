@@ -258,9 +258,9 @@ int cache_close(const char *fpath) {
 
       ssh_scp_close(scp);
       ssh_scp_free(scp);
-      free(buf);
       log_msg("mapping %s -> %s is removed\n", BB_DATA->cache[i].remotepath, BB_DATA->cache[i].localpath);
-      free(BB_DATA->cache[i].localpath);
+      free(buf);
+      // free(BB_DATA->cache[i].localpath); // we do not clean this up because .localpath is directly managed by tmpnam
       free(BB_DATA->cache[i].remotepath);
       for (int j = i; j + 1 < BB_DATA->num_cache; j++) {
         BB_DATA->cache[j] = BB_DATA->cache[j + 1];

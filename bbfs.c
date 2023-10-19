@@ -88,9 +88,17 @@ char* scp_receive(ssh_session session, ssh_scp scp, int *size) {
   int mode;
   char *filename, *buffer;
 
+  rc = ssh_scp_init(scp);
+  if (rc != SSH_OK) {
+    log_msg("Error initializing scp session: %s\n",
+            ssh_get_error(session));
+    ssh_scp_free(scp);
+    return rc;
+  }
+
   rc = ssh_scp_pull_request(scp);
   if (rc != SSH_SCP_REQUEST_NEWFILE) {
-    fprintf(stderr,"Error receiving information about file: %s\n",
+    log_msg("Error receiving information about file: %s\n",
           ssh_get_error(session));
     return NULL;
   }
@@ -98,13 +106,13 @@ char* scp_receive(ssh_session session, ssh_scp scp, int *size) {
   *size = ssh_scp_request_get_size(scp);
   filename = strdup(ssh_scp_request_get_filename(scp));
   mode = ssh_scp_request_get_permissions(scp);
-  fprintf(stderr,"Receiving file %s, size %d, permissions 0%o\n",
+  log_msg("Receiving file %s, size %d, permissions 0%o\n",
           filename, *size, mode);
   free(filename);
 
   buffer = (char *)malloc((*size + 1) * sizeof(char));
   if (buffer == NULL) {
-    fprintf(stderr,"Memory allocation error\n");
+    log_msg("Memory allocation error\n");
     return NULL;
   }
 
@@ -112,7 +120,7 @@ char* scp_receive(ssh_session session, ssh_scp scp, int *size) {
   for (int r = 0; r < *size; ) {
     int st = ssh_scp_read(scp, buffer + r, *size - r);
     if (rc == SSH_ERROR) {
-      fprintf(stderr,"Error receiving file data: %s\n",
+      log_msg("Error receiving file data: %s\n",
               ssh_get_error(session));
       free(buffer);
       return NULL;
@@ -123,7 +131,7 @@ char* scp_receive(ssh_session session, ssh_scp scp, int *size) {
 
   rc = ssh_scp_pull_request(scp);
   if (rc != SSH_SCP_REQUEST_EOF) {
-    fprintf(stderr,"Unexpected request: %s\n",
+    log_msg("Unexpected request: %s\n",
             ssh_get_error(session));
     return NULL;
   }
@@ -164,7 +172,7 @@ int cache_open(const char *fpath, char localpath[]) {
     if (strcmp(BB_DATA->cache[i].remotepath, fpath) == 0) {
       BB_DATA->cache[i].access++;
       strcpy(localpath, BB_DATA->cache[i].localpath);
-      log_msg("remote %s mapped to %s\n", fpath, localpath);
+      log_msg("cached remote %s mapped to %s\n", fpath, localpath);
       return EXIT_SUCCESS;
     }
   }
@@ -183,13 +191,6 @@ int cache_open(const char *fpath, char localpath[]) {
     log_msg("Error allocating scp session: %s\n",
             ssh_get_error(BB_DATA->session));
     return EXIT_FAILURE;
-  }
-  int rc = ssh_scp_init(scp);
-  if (rc != SSH_OK) {
-    log_msg("Error initializing scp session: %s\n",
-            ssh_get_error(BB_DATA->session));
-    ssh_scp_free(scp);
-    return rc;
   }
   int size;
   char* buf = scp_receive(BB_DATA->session, scp, &size);
@@ -258,7 +259,7 @@ int cache_close(const char *fpath) {
       ssh_scp_close(scp);
       ssh_scp_free(scp);
       free(buf);
-      log_msg("mapping %s -> %s is severed\n", BB_DATA->cache[i].remotepath, BB_DATA->cache[i].localpath);
+      log_msg("mapping %s -> %s is removed\n", BB_DATA->cache[i].remotepath, BB_DATA->cache[i].localpath);
       free(BB_DATA->cache[i].localpath);
       free(BB_DATA->cache[i].remotepath);
       for (int j = i; j + 1 < BB_DATA->num_cache; j++) {
@@ -906,7 +907,10 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "cannot parse address");
     exit(EXIT_FAILURE);
   }
+  fprintf(stderr, "%s %s %s\n", user, host, remotepath);
   bb_data->rootdir = remotepath;
+
+  bb_data->num_cache = 0;
 
   // intializing SSH session
   bb_data->session = ssh_new();
@@ -918,13 +922,15 @@ int main(int argc, char *argv[]) {
   ssh_options_set(bb_data->session, SSH_OPTIONS_HOST, host);
   ssh_options_set(bb_data->session, SSH_OPTIONS_USER, user);
 
+  fprintf(stderr, "connecting ...\n");
   int rc = ssh_connect(bb_data->session);
   if (rc != SSH_OK) ssh_error(bb_data->session);
+  fprintf(stderr, "connected ...\n");
 
+  fprintf(stderr, "authenticating ...\n");
   rc = ssh_userauth_publickey_auto(bb_data->session, NULL, NULL);
   if (rc != SSH_AUTH_SUCCESS) ssh_error(bb_data->session);
-
-  fprintf(stderr, "Connected to %s@%s\n", user, host);
+  fprintf(stderr, "authenticated to %s@%s\n", user, host);
 
   // starting fuse
   fprintf(stderr, "about to call fuse_main\n");

@@ -57,3 +57,9 @@ cmake-build-debug/
 *.exe
 *.out
 *.app
+
+bbfs
+CMakeFiles/*
+Makefile
+CMakeCache.txt
+cmake_install.cmake

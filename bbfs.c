@@ -9,9 +9,12 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <fuse.h>
+#include <malloc.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #ifdef HAVE_SYS_XATTR_H
@@ -19,6 +22,11 @@
 #endif
 
 #include "log.h"
+
+void sys_error(const char* msg) {
+  perror(msg);
+  exit(EXIT_FAILURE);
+}
 
 //  All the paths are relative to the root of the mounted
 //  filesystem.
@@ -28,21 +36,289 @@ static void bb_fullpath(char fpath[PATH_MAX], const char *path) {
   log_msg("    bb_fullpath:  rootdir = \"%s\", path = \"%s\", fpath = \"%s\"\n", BB_DATA->rootdir, path, fpath);
 }
 
+/////// SSH stuff
+
+void ssh_free_session(ssh_session session) {
+  ssh_disconnect(session);
+  ssh_free(session);
+}
+
+void ssh_error(ssh_session session) {
+  log_msg("SSH Error: %s\n", ssh_get_error(session));
+  ssh_free_session(session);
+  exit(SSH_ERROR);
+}
+
+int ssh_execute(ssh_session session, char* command, char* output, int size) {
+  ssh_channel channel = ssh_channel_new(session);
+  if (channel == NULL) ssh_error(session);
+  int rc;
+  if ((rc = ssh_channel_open_session(channel)) != SSH_OK) {
+    ssh_channel_free(channel);
+    return SSH_ERROR;
+  }
+  if ((rc = ssh_channel_request_exec(channel, command)) != SSH_OK) {
+    ssh_channel_close(channel);
+    ssh_channel_free(channel);
+    return SSH_ERROR;
+  }
+  int r = 0;
+  while (1) {
+    int rd = ssh_channel_read(channel, output + r, size - r, 0);
+    if (rd < 0) {
+      ssh_channel_close(channel);
+      ssh_channel_free(channel);
+      return SSH_ERROR;
+    } else if (rd == 0) {
+      break;
+    } else {
+      r += rd;
+    }
+  }
+  
+  output[r] = '\0';
+  ssh_channel_send_eof(channel);
+  ssh_channel_close(channel);
+  ssh_channel_free(channel);
+  return SSH_OK;
+}
+
+char* scp_receive(ssh_session session, ssh_scp scp, int *size) {
+  int rc;
+  int mode;
+  char *filename, *buffer;
+
+  rc = ssh_scp_pull_request(scp);
+  if (rc != SSH_SCP_REQUEST_NEWFILE) {
+    fprintf(stderr,"Error receiving information about file: %s\n",
+          ssh_get_error(session));
+    return NULL;
+  }
+
+  *size = ssh_scp_request_get_size(scp);
+  filename = strdup(ssh_scp_request_get_filename(scp));
+  mode = ssh_scp_request_get_permissions(scp);
+  fprintf(stderr,"Receiving file %s, size %d, permissions 0%o\n",
+          filename, *size, mode);
+  free(filename);
+
+  buffer = (char *)malloc((*size + 1) * sizeof(char));
+  if (buffer == NULL) {
+    fprintf(stderr,"Memory allocation error\n");
+    return NULL;
+  }
+
+  ssh_scp_accept_request(scp);
+  for (int r = 0; r < *size; ) {
+    int st = ssh_scp_read(scp, buffer + r, *size - r);
+    if (rc == SSH_ERROR) {
+      fprintf(stderr,"Error receiving file data: %s\n",
+              ssh_get_error(session));
+      free(buffer);
+      return NULL;
+    }
+    r += st;
+  }
+  buffer[*size] = '\0';
+
+  rc = ssh_scp_pull_request(scp);
+  if (rc != SSH_SCP_REQUEST_EOF) {
+    fprintf(stderr,"Unexpected request: %s\n",
+            ssh_get_error(session));
+    return NULL;
+  }
+
+  return buffer;
+}
+
+int scp_write_remote(ssh_session session, ssh_scp scp, char* fpath, char* buf, int size) {
+  int rc;
+  rc = ssh_scp_init(scp);
+  if (rc != SSH_OK) {
+    log_msg("Error initializing scp session: %s\n",
+            ssh_get_error(BB_DATA->session));
+    return rc;
+  }
+  rc = ssh_scp_push_file(scp, fpath, size, S_IRUSR |  S_IWUSR);
+  if (rc != SSH_OK) {
+    log_msg("Can't open remote file: %s\n",
+            ssh_get_error(BB_DATA->session));
+    return rc;
+  }
+  rc = ssh_scp_write(scp, buf, size);
+  if (rc != SSH_OK) {
+    log_msg("Can't write to remote file: %s\n",
+            ssh_get_error(BB_DATA->session));
+    return rc;
+  }
+  return SSH_OK;
+}
+
+/////// Local file caching system stuff
+
+/**
+ * Open remote path by caching in temp file
+*/
+int cache_open(const char *fpath, char localpath[]) {
+  for (int i = 0; i < BB_DATA->num_cache; i++) {
+    if (strcmp(BB_DATA->cache[i].remotepath, fpath) == 0) {
+      BB_DATA->cache[i].access++;
+      strcpy(localpath, BB_DATA->cache[i].localpath);
+      log_msg("remote %s mapped to %s\n", fpath, localpath);
+      return EXIT_SUCCESS;
+    }
+  }
+  // no cached local file
+  if (BB_DATA->num_cache == CACHE_SIZE) { // cache is full
+    return EXIT_FAILURE;
+  }
+  int i = BB_DATA->num_cache++;
+  BB_DATA->cache[i].remotepath = (char*)malloc(sizeof(char) * (strlen(fpath) + 1));
+  strcpy(BB_DATA->cache[i].remotepath, fpath);
+  BB_DATA->cache[i].localpath = tmpnam(NULL);
+  BB_DATA->cache[i].access = 1;
+  // pull file content from SSH to buf using SCP
+  ssh_scp scp = ssh_scp_new(BB_DATA->session, SSH_SCP_READ, fpath);
+  if (scp == NULL) {
+    log_msg("Error allocating scp session: %s\n",
+            ssh_get_error(BB_DATA->session));
+    return EXIT_FAILURE;
+  }
+  int rc = ssh_scp_init(scp);
+  if (rc != SSH_OK) {
+    log_msg("Error initializing scp session: %s\n",
+            ssh_get_error(BB_DATA->session));
+    ssh_scp_free(scp);
+    return rc;
+  }
+  int size;
+  char* buf = scp_receive(BB_DATA->session, scp, &size);
+  if (buf == NULL) {
+    log_msg("error reading remote file %s\n", fpath);
+    ssh_scp_close(scp);
+    ssh_scp_free(scp);
+    return EXIT_FAILURE;
+  }
+  ssh_scp_close(scp);
+  ssh_scp_free(scp);
+  // write file content from buf to local file
+  FILE* f = fopen(BB_DATA->cache[i].localpath, "w");
+  if (f == NULL) {
+    log_error("fopen");
+    return EXIT_FAILURE;
+  }
+  int nwrite = fwrite(buf, sizeof(char), size, f);
+  if (nwrite < strlen(buf)) {
+    log_error("fwrite");
+    return EXIT_FAILURE;
+  }
+
+  strcpy(localpath, BB_DATA->cache[i].localpath);
+  free(buf); fclose(f);
+  log_msg("remote %s mapped to %s\n", fpath, localpath);
+  return EXIT_SUCCESS;
+}
+
+/**
+ * Close remote path. Flush if access to remote 
+*/
+int cache_close(const char *fpath) {
+  for (int i = 0; i < BB_DATA->num_cache; i++) {
+    if (strcmp(BB_DATA->cache[i].remotepath, fpath) == 0) {
+      if (--BB_DATA->cache[i].access > 0) {
+        return EXIT_SUCCESS;
+      }
+      // no more local access to file, time to flush to remote
+      // pull file content from local to buf
+      struct stat sb;
+      int rc = lstat(BB_DATA->cache[i].localpath, &sb);
+      if (rc != EXIT_SUCCESS) {
+        log_error("lstat");
+        return EXIT_FAILURE;
+      }
+      size_t size = sb.st_size;
+      char *buf = (char*)malloc(sizeof(char) * (size + 1));
+      FILE* f = fopen(BB_DATA->cache[i].localpath, "r");
+      int nbytes = fread(buf, sizeof(char), size, f);
+      if (nbytes < size) {
+        log_error("fread");
+        return EXIT_FAILURE;
+      }
+      fclose(f);
+      // push file content from buf to remote
+      ssh_scp scp = ssh_scp_new(BB_DATA->session, SSH_SCP_WRITE, fpath);
+      if (scp == NULL) {
+        log_msg("Error allocating scp session: %s\n",
+                ssh_get_error(BB_DATA->session));
+        free(buf);
+        return EXIT_FAILURE;
+      }
+      rc = scp_write_remote(BB_DATA->session, scp, fpath, buf, size);
+
+      ssh_scp_close(scp);
+      ssh_scp_free(scp);
+      free(buf);
+      log_msg("mapping %s -> %s is severed\n", BB_DATA->cache[i].remotepath, BB_DATA->cache[i].localpath);
+      free(BB_DATA->cache[i].localpath);
+      free(BB_DATA->cache[i].remotepath);
+      for (int j = i; j + 1 < BB_DATA->num_cache; j++) {
+        BB_DATA->cache[j] = BB_DATA->cache[j + 1];
+      }
+      BB_DATA->num_cache--;
+      // clean up here: remove file from cache + clean up pointers
+      return rc;
+    }
+  }
+  return EXIT_FAILURE; // no file in cache with name fpath
+}
+
+/////// BBFS stuff
+
 /**
  * Get file attributes.
  */
 int bb_getattr(const char *path, struct stat *statbuf) {
-  int retstat;
   char fpath[PATH_MAX];
 
   log_command("bb_getattr(path=\"%s\", statbuf=0x%08x)", path, statbuf);
   bb_fullpath(fpath, path);
 
-  retstat = log_syscall("lstat", lstat(fpath, statbuf), 0);
+  char output[BUF_SIZE], command[BUF_SIZE];
+
+  // non-fs stats
+  strcpy(command, "stat -c \"\%d \%i \%f \%h \%u \%g \%t \%s \%X \%Y \%Z \%b\" ");
+  strncat(command, fpath, BUF_SIZE);
+  int rc = ssh_execute(BB_DATA->session, command, output, BUF_SIZE);
+  if (rc != 0) {
+    log_msg("remote stat error\n");
+    return EXIT_FAILURE;
+  } else {
+    rc = sscanf(output, "%lu %lu %x %u %u %u %lx %ld %ld %ld %ld %ld",
+      &statbuf->st_dev, &statbuf->st_ino, &statbuf->st_mode, &statbuf->st_nlink,
+      &statbuf->st_uid, &statbuf->st_gid, &statbuf->st_rdev, &statbuf->st_size,
+      &statbuf->st_blocks, &statbuf->st_atime, &statbuf->st_mtime, &statbuf->st_ctime);
+    if (rc != 12) {
+      log_stat(statbuf);
+      return EXIT_FAILURE;
+    }
+  }
+
+  // fs stats
+  strcpy(command, "stat -f -c \"\%s\" ");
+  strncat(command, fpath, BUF_SIZE);
+  rc = ssh_execute(BB_DATA->session, command, output, BUF_SIZE);
+  if (rc != 0) {
+    log_msg("remote stat error\n");
+    return EXIT_FAILURE;
+  } else {
+    rc = sscanf(output, "%ld", &statbuf->st_blksize);
+    if (rc != 1) {
+      log_stat(statbuf);
+      return EXIT_FAILURE;
+    }
+  }
 
   log_stat(statbuf);
-
-  return retstat;
 }
 
 /**
@@ -222,7 +498,14 @@ int bb_open(const char *path, struct fuse_file_info *fi) {
               path, fi);
   bb_fullpath(fpath, path);
 
-  fd = log_syscall("open", open(fpath, fi->flags), 0);
+  char localpath[L_tmpnam + 1];
+  int rc = cache_open(fpath, localpath);
+  if (rc == EXIT_FAILURE) {
+    log_msg("open failure\n");
+    return rc;
+  }
+
+  fd = log_syscall("open", open(localpath, fi->flags), 0);
   if (fd < 0) {
     retstat = log_error("open");
   }
@@ -290,7 +573,13 @@ int bb_release(const char *path, struct fuse_file_info *fi) {
   log_command("bb_release(path=\"%s\", fi=0x%08x)", path, fi);
   log_fi(fi);
 
-  return log_syscall("close", close(fi->fh), 0);
+  int rc = log_syscall("close", close(fi->fh), 0);
+  if (rc != EXIT_SUCCESS) {
+    return rc;
+  }
+  char fpath[PATH_MAX];
+  bb_fullpath(fpath, path);
+  return cache_close(fpath);
 }
 
 /**
@@ -585,43 +874,64 @@ struct fuse_operations bb_oper = {
 };
 
 void bb_usage() {
-  fprintf(stderr, "usage:  bbfs [FUSE and mount options] rootDir mountPoint logFile\n");
+  fprintf(stderr, "usage:  bbfs [FUSE and mount options] remoteAddress mountPoint logFile\n");
   abort();
 }
 
 int main(int argc, char *argv[]) {
-  int fuse_stat;
-  struct bb_state *bb_data;
   if ((getuid() == 0) || (geteuid() == 0)) {
     fprintf(stderr, "Please do not run bb as root\n");
-    return 1;
+    return EXIT_FAILURE;
   }
-
-  fprintf(stderr, "Fuse library version %d.%d\n", FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION);
 
   if ((argc < 4) || (argv[argc - 3][0] == '-') || (argv[argc - 2][0] == '-') || (argv[argc - 1][0] == '-')) {
     bb_usage();
   }
 
-  bb_data = malloc(sizeof(struct bb_state));
+  struct bb_state *bb_data = malloc(sizeof(struct bb_state));
   if (bb_data == NULL) {
-    perror("main calloc");
-    abort();
+    sys_error("malloc");
   }
 
   char *logFile = argv[argc - 1];
   argv[argc - 1] = NULL;
-  bb_data->rootdir = realpath(argv[argc - 3], NULL);
+  char *remoteAddress = argv[argc - 3];
   argv[argc - 3] = argv[argc - 2];
   argv[argc - 2] = NULL;
   argc -= 2;
 
   bb_data->logfile = log_open(logFile);
+  char user[BUF_SIZE], host[BUF_SIZE], remotepath[BUF_SIZE];
+  if (sscanf(remoteAddress, "%[^@]@%[^:]:%s", user, host, remotepath) < 3) {
+    fprintf(stderr, "cannot parse address");
+    exit(EXIT_FAILURE);
+  }
+  bb_data->rootdir = remotepath;
 
+  // intializing SSH session
+  bb_data->session = ssh_new();
+  if (bb_data->session == NULL) {
+    fprintf(stderr, "cannot initialize ssh session");
+    exit(SSH_ERROR);
+  }
+
+  ssh_options_set(bb_data->session, SSH_OPTIONS_HOST, host);
+  ssh_options_set(bb_data->session, SSH_OPTIONS_USER, user);
+
+  int rc = ssh_connect(bb_data->session);
+  if (rc != SSH_OK) ssh_error(bb_data->session);
+
+  rc = ssh_userauth_publickey_auto(bb_data->session, NULL, NULL);
+  if (rc != SSH_AUTH_SUCCESS) ssh_error(bb_data->session);
+
+  fprintf(stderr, "Connected to %s@%s\n", user, host);
+
+  // starting fuse
   fprintf(stderr, "about to call fuse_main\n");
-  fuse_stat = fuse_main(argc, argv, &bb_oper, bb_data);
+  int fuse_stat = fuse_main(argc, argv, &bb_oper, bb_data);
   fprintf(stderr, "fuse_main returned %d\n", fuse_stat);
 
+  ssh_free_session(bb_data->session);
   free(bb_data);
   return fuse_stat;
 }
